@@ -28,13 +28,24 @@ MAX_WORKERS = 6
 TIMEOUT = (5, 12)  # connect timeout, read timeout
 BODY_SAMPLE_LIMIT = 32 * 1024
 
+# ==========================================
+# 🛡️ MAJBOOT HEADERS (Anti-Bot Bypass)
+# ==========================================
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9,hi-IN;q=0.8,hi;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Pragma": "no-cache",
     "Cache-Control": "no-cache",
 }
 
@@ -130,8 +141,6 @@ def read_sample(response):
             if len(sample) >= BODY_SAMPLE_LIMIT:
                 break
     except requests.RequestException:
-        # The HTTP status and redirect information may still be useful even if
-        # a server closes the response while its body is being sampled.
         pass
 
     encoding = response.encoding or "utf-8"
@@ -159,7 +168,7 @@ def redirect_trace(response):
     """Return a readable redirect chain for the action log."""
     hops = [f"{item.url} -> {item.headers.get('Location', '?')}" for item in response.history]
     if hops:
-        LOG.info("Redirect chain: %s", " | ".join(hops))
+        LOG.info("🔗 Redirect chain: %s", " | ".join(hops))
 
 
 def assess_response(provider, original_url, response, inspect_body=True):
@@ -168,12 +177,12 @@ def assess_response(provider, original_url, response, inspect_body=True):
     final_url = response.url
 
     if status < 200 or status >= 300:
-        LOG.warning("%s: HTTP %s after request to %s", provider, status, original_url)
+        LOG.warning("⚠️ %s: HTTP %s after request to %s", provider, status, original_url)
         if response.history:
             redirect_trace(response)
             if has_domain_or_scheme_changed(original_url, final_url):
                 LOG.warning(
-                    "%s: redirect reached %s, but destination returned HTTP %s; not updating",
+                    "🛑 %s: redirect reached %s, but destination returned HTTP %s; not updating",
                     provider, final_url, status,
                 )
         return None
@@ -181,7 +190,7 @@ def assess_response(provider, original_url, response, inspect_body=True):
     body = read_sample(response) if inspect_body else ""
     warning = page_warning(body)
     if warning:
-        LOG.warning("%s: HTTP %s, but %s; URL left unchanged", provider, status, warning)
+        LOG.warning("⚠️ %s: HTTP %s, but %s; URL left unchanged", provider, status, warning)
         if response.history:
             redirect_trace(response)
         return None
@@ -190,20 +199,20 @@ def assess_response(provider, original_url, response, inspect_body=True):
         redirect_trace(response)
         replacement = replace_origin(original_url, final_url)
         if replacement and replacement != original_url:
-            LOG.info("%s: verified redirect to %s", provider, final_url)
+            LOG.info("✅ %s: verified redirect to %s", provider, final_url)
             return replacement
 
-    LOG.info("%s: reachable (HTTP %s); no domain redirect detected", provider, status)
+    LOG.info("✅ %s: reachable (HTTP %s); no domain redirect detected", provider, status)
     return None
 
 
 def check_provider(provider, url):
     """Probe with GET first, then use HEAD as a limited fallback when needed."""
     if provider.lower() in SKIP_PROVIDERS:
-        LOG.info("Skipping %s (configured skip)", provider)
+        LOG.info("⏭️ Skipping %s (configured skip)", provider)
         return provider, url, None
 
-    LOG.info("Checking %s: %s", provider, url)
+    LOG.info("🔍 Checking %s: %s", provider, url)
     session = requests.Session()
     session.headers.update(HEADERS)
 
@@ -219,21 +228,19 @@ def check_provider(provider, url):
                     new_url = assess_response(provider, url, response, inspect_body=True)
                     return provider, url, new_url
 
-                LOG.warning("%s: GET returned HTTP %s", provider, response.status_code)
+                LOG.warning("⚠️ %s: GET returned HTTP %s", provider, response.status_code)
                 if response.history:
                     redirect_trace(response)
 
         except requests.TooManyRedirects as exc:
-            LOG.error("%s: redirect loop or too many redirects: %s", provider, exc)
+            LOG.error("❌ %s: redirect loop or too many redirects: %s", provider, exc)
         except requests.Timeout:
-            LOG.warning("%s: GET timed out; trying HEAD", provider)
+            LOG.warning("⏳ %s: GET timed out; trying HEAD", provider)
         except requests.ConnectionError as exc:
-            LOG.warning("%s: GET connection/DNS error; trying HEAD (%s)", provider, exc)
+            LOG.warning("🔌 %s: GET connection/DNS error; trying HEAD (%s)", provider, exc)
         except requests.RequestException as exc:
-            LOG.warning("%s: GET request failed; trying HEAD (%s)", provider, exc)
+            LOG.warning("⚠️ %s: GET request failed; trying HEAD (%s)", provider, exc)
 
-        # HEAD is only a fallback signal. Without a readable page, it is not
-        # treated as proof that an HTTP 200 page is the expected provider site.
         try:
             with session.head(
                 url,
@@ -246,25 +253,25 @@ def check_provider(provider, url):
                         replacement = replace_origin(url, response.url)
                         if replacement and replacement != url:
                             LOG.warning(
-                                "%s: redirect confirmed by HEAD only; content was not verified",
+                                "⚠️ %s: redirect confirmed by HEAD only; content was not verified",
                                 provider,
                             )
                             return provider, url, replacement
                     LOG.warning(
-                        "%s: HEAD returned HTTP %s, but page content was not verified; unchanged",
+                        "⚠️ %s: HEAD returned HTTP %s, but page content was not verified; unchanged",
                         provider, response.status_code,
                     )
                 else:
-                    LOG.warning("%s: HEAD returned HTTP %s", provider, response.status_code)
+                    LOG.warning("⚠️ %s: HEAD returned HTTP %s", provider, response.status_code)
                     if response.history:
                         redirect_trace(response)
 
         except requests.Timeout:
-            LOG.error("%s: HEAD timed out", provider)
+            LOG.error("❌ %s: HEAD timed out", provider)
         except requests.ConnectionError as exc:
-            LOG.error("%s: connection/DNS error: %s", provider, exc)
+            LOG.error("❌ %s: connection/DNS error: %s", provider, exc)
         except requests.RequestException as exc:
-            LOG.error("%s: HEAD request failed: %s", provider, exc)
+            LOG.error("❌ %s: HEAD request failed: %s", provider, exc)
 
         return provider, url, None
 
@@ -292,7 +299,6 @@ def main():
     providers = load_provider_urls()
     changes = []
 
-    # A small worker pool keeps checks quick without hitting all hosts at once.
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
             pool.submit(check_provider, name, url): (name, url)
@@ -304,7 +310,7 @@ def main():
             try:
                 _, _, new_url = future.result()
             except Exception:
-                LOG.exception("Unexpected error while checking %s", provider)
+                LOG.exception("💥 Unexpected error while checking %s", provider)
                 continue
 
             if new_url and new_url != old_url:
@@ -312,14 +318,14 @@ def main():
                 changes.append((provider, old_url, new_url))
 
     if not changes:
-        LOG.info("Finished: no verified URL changes found.")
+        LOG.info("🏁 Finished: no verified URL changes found.")
         return
 
     for provider, old_url, new_url in sorted(changes):
-        LOG.info("UPDATED %s: %s -> %s", provider, old_url, new_url)
+        LOG.info("🚀 UPDATED %s: %s -> %s", provider, old_url, new_url)
 
     save_provider_urls(providers)
-    LOG.info("Saved %d URL change(s) to %s", len(changes), URLS_FILE)
+    LOG.info("💾 Saved %d URL change(s) to %s", len(changes), URLS_FILE)
 
 
 if __name__ == "__main__":
@@ -331,5 +337,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        LOG.error("Checker stopped: %s", error)
+        LOG.error("🚨 Checker stopped: %s", error)
         raise
