@@ -41,18 +41,30 @@ jobs:
             ghcr.io/flaresolverr/flaresolverr:latest
 
           echo "Waiting for FlareSolverr to become ready..."
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:8191/health > /dev/null; then
-              echo "✅ FlareSolverr is ready"
+          READY=0
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8191/health > /dev/null 2>&1; then
+              echo "✅ FlareSolverr ready after ${i} attempts"
+              READY=1
               break
             fi
             sleep 2
           done
 
-          curl -s http://localhost:8191/health || echo "⚠️ FlareSolverr health check failed"
+          if [ "$READY" != "1" ]; then
+            echo "⚠️ FlareSolverr did not become ready"
+            docker logs flaresolverr || true
+            exit 1
+          fi
+
+          curl -s http://localhost:8191/health
 
       - name: Run provider URL checker
         run: python .github/scripts/url-checker.py
+
+      - name: Dump FlareSolverr logs on failure
+        if: failure()
+        run: docker logs flaresolverr || true
 
       - name: Stop FlareSolverr
         if: always()
