@@ -32,6 +32,11 @@ jobs:
         run: python -m pip install --upgrade pip curl_cffi cloudscraper
 
       - name: Run provider URL checker
+        env:
+          # Optional: add PROVIDER_PROXY secret for IP-blocked sites.
+          # Example value: socks5://user:pass@host:port  or  http://user:pass@host:port
+          HTTPS_PROXY: ${{ secrets.PROVIDER_PROXY }}
+          HTTP_PROXY: ${{ secrets.PROVIDER_PROXY }}
         run: python .github/scripts/url-checker.py
 
       - name: Commit and push URL changes
