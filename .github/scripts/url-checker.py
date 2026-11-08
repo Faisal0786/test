@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Check provider base URLs with CloudStream-like anti-bot protection.
 
-Key fixes in this version:
-1. Trust redirect chain even when destination returns a *security block* (403/503).
-   This catches e.g. zinkmovies where the redirect to a new domain is legitimate
-   but the new domain blocks our IP.
-2. Impersonation chain: try chrome_android -> chrome131 -> safari17_0 on 403.
-3. DNS failures are logged clearly and not retried (won't help).
-4. Honors HTTPS_PROXY env var for IP-based blocks.
+Anti-bot chain on 403:
+  1. chrome_android -> chrome131 -> safari17_0 impersonation
+  2. DDoS-Guard cookie retry
+  3. cloudscraper fallback
+  4. FlareSolverr (headless Chrome) — the only one that beats Cloudflare's IP blocks
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,8 +48,11 @@ MAX_WORKERS = 6
 TIMEOUT = (8, 20)
 BODY_SAMPLE_LIMIT = 32 * 1024
 
-# Try each in order on 403.
 IMPERSONATE_TARGETS = ("chrome_android", "chrome131", "safari17_0")
+
+# FlareSolverr runs inside the same job on localhost:8191
+FLARESOLVERR_URL = "http://localhost:8191/v1"
+FLARESOLVERR_TIMEOUT = 90  # seconds
 
 HEADERS = {
     "User-Agent": (
@@ -155,13 +156,9 @@ def replace_origin(old_url, destination_url):
     destination = urlsplit(destination_url)
     if destination.scheme not in {"http", "https"} or not destination.netloc:
         return None
-
     return urlunsplit((
-        destination.scheme,
-        destination.netloc,
-        old.path,
-        old.query,
-        old.fragment,
+        destination.scheme, destination.netloc,
+        old.path, old.query, old.fragment,
     ))
 
 
@@ -195,19 +192,15 @@ def read_sample(response):
 def page_warning(body):
     if not body:
         return None
-
     title_match = re.search(r"<title[^>]*>(.*?)</title>", body, flags=re.I | re.S)
     title = (
         unescape(re.sub(r"\s+", " ", title_match.group(1))).strip().lower()
         if title_match else ""
     )
-
     if any(marker in body for marker in CHALLENGE_MARKERS):
         return "page appears to be a security/anti-bot challenge"
-
     if any(marker in title or marker in body for marker in PARKED_MARKERS):
         return "page appears to be parked, expired, or suspended"
-
     return None
 
 
@@ -221,14 +214,9 @@ def redirect_trace(response):
 
 
 def _is_security_block(response):
-    """True if response looks like a security/WAF block, not a real HTTP error.
-
-    Used to trust redirects whose destination is blocked — the redirect itself
-    was issued by the *original* (working) domain, so it's legitimate.
-    """
     if response.status_code not in (403, 503):
         return False
-    headers = response.headers
+    headers = response.headers or {}
     server = (headers.get("Server", "") or "").lower()
     if any(marker in server for marker in ("cloudflare", "ddos-guard", "sucuri", "akamai")):
         return True
@@ -240,7 +228,6 @@ def _is_security_block(response):
 def assess_response(provider, original_url, response, inspect_body=True):
     status = response.status_code
     final_url = response.url
-
     redirect_changed = bool(
         response.history and has_domain_or_scheme_changed(original_url, final_url)
     )
@@ -248,26 +235,17 @@ def assess_response(provider, original_url, response, inspect_body=True):
     if redirect_changed:
         redirect_trace(response)
 
-    # ---------- Non-2xx path ----------
     if status < 200 or status >= 300:
         LOG.warning("⚠️ %s: HTTP %s after request to %s", provider, status, original_url)
-
-        # NEW: trust redirect if destination is blocked by security, not a real error
         if redirect_changed and _is_security_block(response):
             replacement = replace_origin(original_url, final_url)
             if replacement and replacement != original_url:
                 LOG.warning(
                     "🟡 %s: trusting redirect to %s "
-                    "(destination is security-blocked, but the redirect itself is legitimate)",
+                    "(destination is security-blocked, but redirect is legitimate)",
                     provider, final_url,
                 )
                 return replacement
-            LOG.warning(
-                "🛑 %s: redirect reached %s but produced an unusable URL; not updating",
-                provider, final_url,
-            )
-            return None
-
         if redirect_changed:
             LOG.warning(
                 "🛑 %s: redirect reached %s, but destination returned HTTP %s; not updating",
@@ -275,7 +253,6 @@ def assess_response(provider, original_url, response, inspect_body=True):
             )
         return None
 
-    # ---------- 2xx path ----------
     body = read_sample(response) if inspect_body else ""
     warning = page_warning(body)
     if warning:
@@ -292,7 +269,7 @@ def assess_response(provider, original_url, response, inspect_body=True):
     return None
 
 
-# ---------- anti-bot bypass ----------
+# ---------- anti-bot bypasses ----------
 
 def _is_ddos_guard(response):
     server = (response.headers.get("Server", "") or "").lower()
@@ -304,13 +281,11 @@ def _ddos_guard_retry(session, url, provider):
     try:
         session.get(
             "https://check.ddos-guard.net/check.js",
-            timeout=TIMEOUT,
-            allow_redirects=True,
+            timeout=TIMEOUT, allow_redirects=True,
         )
     except Exception as exc:
         LOG.warning("⚠️ %s: DDoS-Guard cookie fetch failed: %s", provider, exc)
         return None
-
     try:
         return session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
     except Exception as exc:
@@ -332,6 +307,80 @@ def _cloudscraper_fallback(url, provider):
         LOG.warning("⚠️ %s: cloudscraper failed: %s", provider, exc)
         return None
 
+
+# ---------- FlareSolverr (headless Chrome) ----------
+
+class _FakeRedirectHop:
+    def __init__(self, url, location):
+        self.url = url
+        self.headers = {"Location": location}
+
+
+class _FlareSolverrResponse:
+    """Adapter that mimics a requests Response for our assessor."""
+
+    def __init__(self, original_url, solution):
+        self.status_code = int(solution.get("status", 200) or 200)
+        self.url = solution.get("url") or original_url
+        self.encoding = "utf-8"
+        self.headers = {"Server": "flaresolverr"}
+        self._body = (solution.get("response") or "").encode("utf-8", errors="ignore")
+        self.history = []
+        if self.url != original_url:
+            self.history = [_FakeRedirectHop(original_url, self.url)]
+
+    def iter_content(self, chunk_size=8192):
+        for i in range(0, len(self._body), chunk_size):
+            yield self._body[i:i + chunk_size]
+
+    def close(self):
+        pass
+
+
+def _flaresolverr_fallback(url, provider):
+    """Ask local FlareSolverr (headless Chrome) to fetch the URL.
+
+    This is the last line of defense against Cloudflare's IP-level blocks that
+    pure TLS impersonation cannot solve.
+    """
+    LOG.info("🎭 %s: trying FlareSolverr (headless Chrome)", provider)
+    try:
+        resp = cffi_requests.post(
+            FLARESOLVERR_URL,
+            json={
+                "cmd": "request.get",
+                "url": url,
+                "maxTimeout": FLARESOLVERR_TIMEOUT * 1000,
+            },
+            timeout=FLARESOLVERR_TIMEOUT,
+        )
+    except CurlConnectionError as exc:
+        LOG.debug("FlareSolverr not running for %s: %s", provider, exc)
+        return None
+    except Exception as exc:
+        LOG.warning("⚠️ %s: FlareSolverr request failed: %s", provider, exc)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        LOG.warning("⚠️ %s: FlareSolverr returned non-JSON", provider)
+        return None
+
+    if data.get("status") != "ok":
+        msg = (data.get("message") or "")[:120]
+        LOG.warning("⚠️ %s: FlareSolverr could not solve (%s)", provider, msg)
+        return None
+
+    solution = data.get("solution") or {}
+    LOG.info(
+        "🎭 %s: FlareSolverr solved — final URL %s (HTTP %s)",
+        provider, solution.get("url"), solution.get("status"),
+    )
+    return _FlareSolverrResponse(url, solution)
+
+
+# ---------- HEAD fallback ----------
 
 def _head_fallback(session, provider, url):
     if session is None:
@@ -388,8 +437,10 @@ def check_provider(provider, url):
 
     opened_sessions = []
     chosen_response = None
+    saw_403 = False
 
     try:
+        # --- Layer 1 & 2: TLS impersonation + DDoS-Guard retry ---
         for target in IMPERSONATE_TARGETS:
             try:
                 session = _new_session(target)
@@ -423,23 +474,22 @@ def check_provider(provider, url):
                 LOG.warning("⚠️ %s: %s failed: %s", provider, target, exc)
                 continue
 
-            # 2xx success on this target
             if 200 <= response.status_code < 300:
                 chosen_response = response
                 break
 
-            # DDoS-Guard retry
-            if response.status_code == 403 and _is_ddos_guard(response):
-                _close_quietly(response)
-                response = _ddos_guard_retry(session, url, provider)
-                if response is not None and 200 <= response.status_code < 300:
-                    chosen_response = response
-                    break
-                if response is not None:
+            if response.status_code == 403:
+                saw_403 = True
+                if _is_ddos_guard(response):
                     _close_quietly(response)
-                continue
+                    response = _ddos_guard_retry(session, url, provider)
+                    if response is not None and 200 <= response.status_code < 300:
+                        chosen_response = response
+                        break
+                    if response is not None:
+                        _close_quietly(response)
+                    continue
 
-            # Redirect + security block — keep for trust-redirect assessment
             if (
                 response.history
                 and has_domain_or_scheme_changed(url, response.url)
@@ -452,15 +502,17 @@ def check_provider(provider, url):
                 chosen_response = response
                 break
 
-            # Other status — try next target
-            LOG.debug("%s: %s returned HTTP %s", provider, target, response.status_code)
             _close_quietly(response)
 
-        # Last resort
-        if chosen_response is None:
+        # --- Layer 3: cloudscraper ---
+        if chosen_response is None and saw_403:
             chosen_response = _cloudscraper_fallback(url, provider)
 
-        # Assess
+        # --- Layer 4: FlareSolverr (headless Chrome) ---
+        if chosen_response is None and saw_403:
+            chosen_response = _flaresolverr_fallback(url, provider)
+
+        # --- Assess whatever we got ---
         if chosen_response is not None:
             try:
                 new_url = assess_response(
@@ -471,7 +523,6 @@ def check_provider(provider, url):
                 _close_quietly(chosen_response)
             return provider, url, new_url
 
-        # Total failure — HEAD fallback
         first_session = opened_sessions[0] if opened_sessions else None
         return _head_fallback(first_session, provider, url)
 
