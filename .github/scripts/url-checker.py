@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Check provider base URLs with CloudStream-like anti-bot protection.
 
-FIX: `okhttp4_android10` is not a built-in curl_cffi target. We now:
-1. Primary: impersonate a supported Android Chrome profile (`chrome_android`).
-2. Secondary (on 403): retry with custom OkHttp4/Android10 JA3+Akamai fingerprints.
-3. DDoS-Guard cookie retry and cloudscraper fallback retained.
+Key fixes in this version:
+1. Trust redirect chain even when destination returns a *security block* (403/503).
+   This catches e.g. zinkmovies where the redirect to a new domain is legitimate
+   but the new domain blocks our IP.
+2. Impersonation chain: try chrome_android -> chrome131 -> safari17_0 on 403.
+3. DNS failures are logged clearly and not retried (won't help).
+4. Honors HTTPS_PROXY env var for IP-based blocks.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,7 +27,7 @@ from curl_cffi.requests.exceptions import (
 )
 
 try:
-    import cloudscraper  # optional fallback for Cloudflare
+    import cloudscraper
     _HAS_CLOUDSCRAPER = True
 except ImportError:
     cloudscraper = None
@@ -44,34 +47,11 @@ REPO_ROOT = next(
 URLS_FILE = REPO_ROOT / "urls.json"
 SKIP_PROVIDERS = {"nfmirror"}
 MAX_WORKERS = 6
-TIMEOUT = (8, 20)  # connect, read — generous for slow anti-bot sites
+TIMEOUT = (8, 20)
 BODY_SAMPLE_LIMIT = 32 * 1024
 
-# Primary: a supported browser target that is close to CloudStream's OkHttp stack.
-PRIMARY_IMPERSONATE = "chrome_android"  # or "chrome131_android" if you prefer a pinned version
-
-# Secondary: custom OkHttp4/Android10 fingerprint (used only when primary gets 403).
-OKHTTP_JA3 = ",".join([
-    "771",
-    "4865-4866-4867-49195-49196-52393-49199-49200-52392-49171-49172-156-157-47-53",
-    "0-23-65281-10-11-35-16-5-13-51-45-43-21",
-    "29-23-24",
-    "0",
-])
-OKHTTP_AKAMAI = "4:16777216|16711681|0|m,p,a,s"
-OKHTTP_EXTRA_FP = {
-    "tls_signature_algorithms": [
-        "ecdsa_secp256r1_sha256",
-        "rsa_pss_rsae_sha256",
-        "rsa_pkcs1_sha256",
-        "ecdsa_secp384r1_sha384",
-        "rsa_pss_rsae_sha384",
-        "rsa_pkcs1_sha384",
-        "rsa_pss_rsae_sha512",
-        "rsa_pkcs1_sha512",
-        "rsa_pkcs1_sha1",
-    ],
-}
+# Try each in order on 403.
+IMPERSONATE_TARGETS = ("chrome_android", "chrome131", "safari17_0")
 
 HEADERS = {
     "User-Agent": (
@@ -129,7 +109,7 @@ PARKED_MARKERS = (
 LOG = logging.getLogger("url_checker")
 
 
-# ---------- validation / URL helpers (unchanged) ----------
+# ---------- validation / URL helpers ----------
 
 def load_provider_urls():
     try:
@@ -185,7 +165,7 @@ def replace_origin(old_url, destination_url):
     ))
 
 
-# ---------- response inspection (unchanged) ----------
+# ---------- response inspection ----------
 
 def _close_quietly(response):
     try:
@@ -240,31 +220,69 @@ def redirect_trace(response):
         LOG.info("🔗 Redirect chain: %s", " | ".join(hops))
 
 
+def _is_security_block(response):
+    """True if response looks like a security/WAF block, not a real HTTP error.
+
+    Used to trust redirects whose destination is blocked — the redirect itself
+    was issued by the *original* (working) domain, so it's legitimate.
+    """
+    if response.status_code not in (403, 503):
+        return False
+    headers = response.headers
+    server = (headers.get("Server", "") or "").lower()
+    if any(marker in server for marker in ("cloudflare", "ddos-guard", "sucuri", "akamai")):
+        return True
+    if "cf-ray" in headers or "cf-mitigated" in headers:
+        return True
+    return False
+
+
 def assess_response(provider, original_url, response, inspect_body=True):
     status = response.status_code
     final_url = response.url
 
+    redirect_changed = bool(
+        response.history and has_domain_or_scheme_changed(original_url, final_url)
+    )
+
+    if redirect_changed:
+        redirect_trace(response)
+
+    # ---------- Non-2xx path ----------
     if status < 200 or status >= 300:
         LOG.warning("⚠️ %s: HTTP %s after request to %s", provider, status, original_url)
-        if response.history:
-            redirect_trace(response)
-            if has_domain_or_scheme_changed(original_url, final_url):
+
+        # NEW: trust redirect if destination is blocked by security, not a real error
+        if redirect_changed and _is_security_block(response):
+            replacement = replace_origin(original_url, final_url)
+            if replacement and replacement != original_url:
                 LOG.warning(
-                    "🛑 %s: redirect reached %s, but destination returned HTTP %s; not updating",
-                    provider, final_url, status,
+                    "🟡 %s: trusting redirect to %s "
+                    "(destination is security-blocked, but the redirect itself is legitimate)",
+                    provider, final_url,
                 )
+                return replacement
+            LOG.warning(
+                "🛑 %s: redirect reached %s but produced an unusable URL; not updating",
+                provider, final_url,
+            )
+            return None
+
+        if redirect_changed:
+            LOG.warning(
+                "🛑 %s: redirect reached %s, but destination returned HTTP %s; not updating",
+                provider, final_url, status,
+            )
         return None
 
+    # ---------- 2xx path ----------
     body = read_sample(response) if inspect_body else ""
     warning = page_warning(body)
     if warning:
         LOG.warning("⚠️ %s: HTTP %s, but %s; URL left unchanged", provider, status, warning)
-        if response.history:
-            redirect_trace(response)
         return None
 
-    if response.history and has_domain_or_scheme_changed(original_url, final_url):
-        redirect_trace(response)
+    if redirect_changed:
         replacement = replace_origin(original_url, final_url)
         if replacement and replacement != original_url:
             LOG.info("✅ %s: verified redirect to %s", provider, final_url)
@@ -279,11 +297,6 @@ def assess_response(provider, original_url, response, inspect_body=True):
 def _is_ddos_guard(response):
     server = (response.headers.get("Server", "") or "").lower()
     return "ddos-guard" in server or "ddos_guard" in server
-
-
-def _is_cloudflare(response):
-    server = (response.headers.get("Server", "") or "").lower()
-    return "cloudflare" in server
 
 
 def _ddos_guard_retry(session, url, provider):
@@ -320,32 +333,9 @@ def _cloudscraper_fallback(url, provider):
         return None
 
 
-# ---------- custom OkHttp fingerprint fallback ----------
-
-def _custom_okhttp_get(url, provider):
-    """Retry with explicit OkHttp4/Android10 JA3+Akamai when browser profile gets 403."""
-    LOG.info("🔧 %s: retrying with custom OkHttp4/Android10 fingerprint", provider)
-    try:
-        session = cffi_requests.Session()
-        session.headers.update(HEADERS)
-        response = session.get(
-            url,
-            ja3=OKHTTP_JA3,
-            akamai=OKHTTP_AKAMAI,
-            extra_fp=OKHTTP_EXTRA_FP,
-            timeout=TIMEOUT,
-            allow_redirects=True,
-            stream=True,
-        )
-        return response, session
-    except Exception as exc:
-        LOG.warning("⚠️ %s: custom OkHttp retry failed: %s", provider, exc)
-        return None, None
-
-
-# ---------- HEAD fallback ----------
-
 def _head_fallback(session, provider, url):
+    if session is None:
+        return provider, url, None
     response = None
     try:
         response = session.head(url, timeout=TIMEOUT, allow_redirects=True)
@@ -383,6 +373,12 @@ def _head_fallback(session, provider, url):
 
 # ---------- per-provider check ----------
 
+def _new_session(impersonate):
+    session = cffi_requests.Session(impersonate=impersonate)
+    session.headers.update(HEADERS)
+    return session
+
+
 def check_provider(provider, url):
     if provider.lower() in SKIP_PROVIDERS:
         LOG.info("⏭️ Skipping %s (configured skip)", provider)
@@ -390,65 +386,104 @@ def check_provider(provider, url):
 
     LOG.info("🔍 Checking %s: %s", provider, url)
 
-    # --- Primary attempt: supported Android Chrome profile ---
-    session = cffi_requests.Session(impersonate=PRIMARY_IMPERSONATE)
-    session.headers.update(HEADERS)
+    opened_sessions = []
+    chosen_response = None
 
     try:
-        response = None
-        try:
-            response = session.get(
-                url,
-                timeout=TIMEOUT,
-                allow_redirects=True,
-                stream=True,
-            )
-        except CurlTooManyRedirects as exc:
-            LOG.error("❌ %s: redirect loop: %s", provider, exc)
-            return provider, url, None
-        except (CurlTimeout, CurlConnectionError, CurlRequestException) as exc:
-            LOG.warning("⚠️ %s: primary GET failed; trying HEAD (%s)", provider, exc)
-            return _head_fallback(session, provider, url)
+        for target in IMPERSONATE_TARGETS:
+            try:
+                session = _new_session(target)
+                opened_sessions.append(session)
+            except Exception as exc:
+                LOG.debug("%s: impersonate=%s unavailable (%s)", provider, target, exc)
+                continue
 
-        # --- Handle 403 with DDoS-Guard / Cloudflare / custom OkHttp ---
-        if response.status_code == 403:
-            if _is_ddos_guard(response):
+            try:
+                response = session.get(
+                    url, timeout=TIMEOUT, allow_redirects=True, stream=True,
+                )
+            except CurlTooManyRedirects as exc:
+                LOG.error("❌ %s: redirect loop: %s", provider, exc)
+                return provider, url, None
+            except CurlConnectionError as exc:
+                err = str(exc).lower()
+                if "resolve host" in err or "name not found" in err or "could not resolve" in err:
+                    LOG.error(
+                        "❌ %s: DNS resolution failed for %s — domain likely dead, "
+                        "manual update required",
+                        provider, url,
+                    )
+                    return provider, url, None
+                LOG.warning("⚠️ %s: %s connection failed: %s", provider, target, exc)
+                continue
+            except CurlTimeout:
+                LOG.warning("⏳ %s: %s timed out", provider, target)
+                continue
+            except CurlRequestException as exc:
+                LOG.warning("⚠️ %s: %s failed: %s", provider, target, exc)
+                continue
+
+            # 2xx success on this target
+            if 200 <= response.status_code < 300:
+                chosen_response = response
+                break
+
+            # DDoS-Guard retry
+            if response.status_code == 403 and _is_ddos_guard(response):
                 _close_quietly(response)
                 response = _ddos_guard_retry(session, url, provider)
-            elif _is_cloudflare(response):
-                _close_quietly(response)
-                response = _cloudscraper_fallback(url, provider)
-
-            # If still 403 or no response, try custom OkHttp fingerprint
-            if response is None or response.status_code == 403:
+                if response is not None and 200 <= response.status_code < 300:
+                    chosen_response = response
+                    break
                 if response is not None:
                     _close_quietly(response)
-                custom_resp, custom_sess = _custom_okhttp_get(url, provider)
-                if custom_resp is not None:
-                    response = custom_resp
-                    session = custom_sess  # swap in for subsequent assessment
+                continue
 
-        # --- Assess final response ---
-        if response is not None and 200 <= response.status_code < 300:
-            try:
-                new_url = assess_response(provider, url, response, inspect_body=True)
-            finally:
-                _close_quietly(response)
-            return provider, url, new_url
+            # Redirect + security block — keep for trust-redirect assessment
+            if (
+                response.history
+                and has_domain_or_scheme_changed(url, response.url)
+                and _is_security_block(response)
+            ):
+                LOG.info(
+                    "🟡 %s: %s got redirect + security block; keeping for assessment",
+                    provider, target,
+                )
+                chosen_response = response
+                break
 
-        if response is not None:
-            LOG.warning("⚠️ %s: final GET returned HTTP %s", provider, response.status_code)
-            if response.history:
-                redirect_trace(response)
+            # Other status — try next target
+            LOG.debug("%s: %s returned HTTP %s", provider, target, response.status_code)
             _close_quietly(response)
 
-        return _head_fallback(session, provider, url)
+        # Last resort
+        if chosen_response is None:
+            chosen_response = _cloudscraper_fallback(url, provider)
+
+        # Assess
+        if chosen_response is not None:
+            try:
+                new_url = assess_response(
+                    provider, url, chosen_response,
+                    inspect_body=(200 <= chosen_response.status_code < 300),
+                )
+            finally:
+                _close_quietly(chosen_response)
+            return provider, url, new_url
+
+        # Total failure — HEAD fallback
+        first_session = opened_sessions[0] if opened_sessions else None
+        return _head_fallback(first_session, provider, url)
 
     finally:
-        session.close()
+        for s in opened_sessions:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 
-# ---------- persistence (unchanged) ----------
+# ---------- persistence ----------
 
 def save_provider_urls(data):
     temporary_file = URLS_FILE.with_suffix(URLS_FILE.suffix + ".tmp")
