@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Check provider base URLs with CloudStream-like anti-bot protection.
 
-Anti-bot chain on 403:
-  1. chrome_android -> chrome131 -> safari17_0 impersonation
-  2. DDoS-Guard cookie retry
-  3. cloudscraper fallback
-  4. FlareSolverr (headless Chrome) — the only one that beats Cloudflare's IP blocks
+Anti-bot chain (all layers tried until one returns 2xx):
+  Layer 1: curl_cffi TLS impersonation (chrome_android / chrome131 / safari17_0)
+  Layer 2: DDoS-Guard cookie retry
+  Layer 3: cloudscraper (Cloudflare JS challenge)
+  Layer 4: FlareSolverr (headless Chrome — beats Cloudflare IP blocks)
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,9 +50,8 @@ BODY_SAMPLE_LIMIT = 32 * 1024
 
 IMPERSONATE_TARGETS = ("chrome_android", "chrome131", "safari17_0")
 
-# FlareSolverr runs inside the same job on localhost:8191
 FLARESOLVERR_URL = "http://localhost:8191/v1"
-FLARESOLVERR_TIMEOUT = 90  # seconds
+FLARESOLVERR_TIMEOUT = 90
 
 HEADERS = {
     "User-Agent": (
@@ -269,7 +268,7 @@ def assess_response(provider, original_url, response, inspect_body=True):
     return None
 
 
-# ---------- anti-bot bypasses ----------
+# ---------- anti-bot layer 2: DDoS-Guard ----------
 
 def _is_ddos_guard(response):
     server = (response.headers.get("Server", "") or "").lower()
@@ -293,10 +292,12 @@ def _ddos_guard_retry(session, url, provider):
         return None
 
 
+# ---------- anti-bot layer 3: cloudscraper ----------
+
 def _cloudscraper_fallback(url, provider):
     if not _HAS_CLOUDSCRAPER:
         return None
-    LOG.info("☁️ %s: trying cloudscraper fallback", provider)
+    LOG.info("☁️ %s: trying cloudscraper", provider)
     try:
         scraper = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "android", "mobile": True},
@@ -308,7 +309,7 @@ def _cloudscraper_fallback(url, provider):
         return None
 
 
-# ---------- FlareSolverr (headless Chrome) ----------
+# ---------- anti-bot layer 4: FlareSolverr ----------
 
 class _FakeRedirectHop:
     def __init__(self, url, location):
@@ -338,11 +339,6 @@ class _FlareSolverrResponse:
 
 
 def _flaresolverr_fallback(url, provider):
-    """Ask local FlareSolverr (headless Chrome) to fetch the URL.
-
-    This is the last line of defense against Cloudflare's IP-level blocks that
-    pure TLS impersonation cannot solve.
-    """
     LOG.info("🎭 %s: trying FlareSolverr (headless Chrome)", provider)
     try:
         resp = cffi_requests.post(
@@ -355,7 +351,7 @@ def _flaresolverr_fallback(url, provider):
             timeout=FLARESOLVERR_TIMEOUT,
         )
     except CurlConnectionError as exc:
-        LOG.debug("FlareSolverr not running for %s: %s", provider, exc)
+        LOG.warning("🚫 %s: FlareSolverr not reachable at %s (%s)", provider, FLARESOLVERR_URL, exc)
         return None
     except Exception as exc:
         LOG.warning("⚠️ %s: FlareSolverr request failed: %s", provider, exc)
@@ -368,7 +364,7 @@ def _flaresolverr_fallback(url, provider):
         return None
 
     if data.get("status") != "ok":
-        msg = (data.get("message") or "")[:120]
+        msg = (data.get("message") or "")[:160]
         LOG.warning("⚠️ %s: FlareSolverr could not solve (%s)", provider, msg)
         return None
 
@@ -420,6 +416,40 @@ def _head_fallback(session, provider, url):
     return provider, url, None
 
 
+# ---------- anti-bot orchestration ----------
+
+def _try_anti_bot_layers(url, provider, sessions_by_target, saw_403):
+    """Try remaining anti-bot layers after TLS impersonation failed.
+
+    FIX: Each layer is tried until one returns a 2xx. Previously, cloudscraper
+    returning a 403 response (not None) caused FlareSolverr to be skipped.
+    """
+    if not saw_403:
+        return None
+
+    # Layer 3: cloudscraper
+    resp = _cloudscraper_fallback(url, provider)
+    if resp is not None:
+        if 200 <= resp.status_code < 300:
+            LOG.info("☁️ %s: cloudscraper solved (HTTP %s)", provider, resp.status_code)
+            return resp
+        LOG.info("☁️ %s: cloudscraper still blocked (HTTP %s)", provider, resp.status_code)
+        _close_quietly(resp)
+
+    # Layer 4: FlareSolverr
+    resp = _flaresolverr_fallback(url, provider)
+    if resp is not None:
+        if 200 <= resp.status_code < 300:
+            return resp
+        LOG.warning(
+            "🎭 %s: FlareSolverr returned HTTP %s — trying DDoS-Guard via solved session",
+            provider, resp.status_code,
+        )
+        _close_quietly(resp)
+
+    return None
+
+
 # ---------- per-provider check ----------
 
 def _new_session(impersonate):
@@ -440,7 +470,7 @@ def check_provider(provider, url):
     saw_403 = False
 
     try:
-        # --- Layer 1 & 2: TLS impersonation + DDoS-Guard retry ---
+        # --- Layer 1 & 2: TLS impersonation + DDoS-Guard ---
         for target in IMPERSONATE_TARGETS:
             try:
                 session = _new_session(target)
@@ -504,15 +534,13 @@ def check_provider(provider, url):
 
             _close_quietly(response)
 
-        # --- Layer 3: cloudscraper ---
-        if chosen_response is None and saw_403:
-            chosen_response = _cloudscraper_fallback(url, provider)
+        # --- Layers 3 & 4: cloudscraper -> FlareSolverr ---
+        if chosen_response is None:
+            chosen_response = _try_anti_bot_layers(
+                url, provider, opened_sessions, saw_403,
+            )
 
-        # --- Layer 4: FlareSolverr (headless Chrome) ---
-        if chosen_response is None and saw_403:
-            chosen_response = _flaresolverr_fallback(url, provider)
-
-        # --- Assess whatever we got ---
+        # --- Assess ---
         if chosen_response is not None:
             try:
                 new_url = assess_response(
