@@ -15,7 +15,7 @@ concurrency:
 jobs:
   check-urls:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -28,16 +28,35 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: python -m pip install --upgrade pip curl_cffi cloudscraper
 
+      - name: Start FlareSolverr (Cloudflare bypass via headless Chrome)
+        run: |
+          docker run -d --name flaresolverr \
+            -p 8191:8191 \
+            -e LOG_LEVEL=info \
+            -e CAPTCHA_SOLVER=none \
+            --restart=no \
+            ghcr.io/flaresolverr/flaresolverr:latest
+
+          echo "Waiting for FlareSolverr to become ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8191/health > /dev/null; then
+              echo "✅ FlareSolverr is ready"
+              break
+            fi
+            sleep 2
+          done
+
+          curl -s http://localhost:8191/health || echo "⚠️ FlareSolverr health check failed"
+
       - name: Run provider URL checker
-        env:
-          # Optional: add PROVIDER_PROXY secret for IP-blocked sites.
-          # Example value: socks5://user:pass@host:port  or  http://user:pass@host:port
-          HTTPS_PROXY: ${{ secrets.PROVIDER_PROXY }}
-          HTTP_PROXY: ${{ secrets.PROVIDER_PROXY }}
         run: python .github/scripts/url-checker.py
+
+      - name: Stop FlareSolverr
+        if: always()
+        run: docker stop flaresolverr || true
 
       - name: Commit and push URL changes
         run: |
